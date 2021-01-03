@@ -276,8 +276,7 @@ class InverseMelScale(torch.nn.Module):
     r"""Solve for a normal STFT from a mel frequency STFT, using a conversion
     matrix.  This uses triangular filter banks.
 
-    It minimizes the euclidian norm between the input mel-spectrogram and the product between
-    the estimated spectrogram and the filter banks using SGD.
+    It uses a pseudo inverse of the FB matrix to retrieve STFT from mel frequency STFT
 
     Args:
         n_stft (int): Number of bins in STFT. See ``n_fft`` in :class:`Spectrogram`.
@@ -285,38 +284,28 @@ class InverseMelScale(torch.nn.Module):
         sample_rate (int, optional): Sample rate of audio signal. (Default: ``16000``)
         f_min (float, optional): Minimum frequency. (Default: ``0.``)
         f_max (float or None, optional): Maximum frequency. (Default: ``sample_rate // 2``)
-        max_iter (int, optional): Maximum number of optimization iterations. (Default: ``100000``)
-        tolerance_loss (float, optional): Value of loss to stop optimization at. (Default: ``1e-5``)
-        tolerance_change (float, optional): Difference in losses to stop optimization at. (Default: ``1e-8``)
-        sgdargs (dict or None, optional): Arguments for the SGD optimizer. (Default: ``None``)
     """
-    __constants__ = ['n_stft', 'n_mels', 'sample_rate', 'f_min', 'f_max', 'max_iter', 'tolerance_loss',
-                     'tolerance_change', 'sgdargs']
+    __constants__ = ['n_stft', 'n_mels', 'sample_rate', 'f_min', 'f_max']
 
     def __init__(self,
                  n_stft: int,
                  n_mels: int = 128,
                  sample_rate: int = 16000,
                  f_min: float = 0.,
-                 f_max: Optional[float] = None,
-                 max_iter: int = 100000,
-                 tolerance_loss: float = 1e-5,
-                 tolerance_change: float = 1e-8,
-                 sgdargs: Optional[dict] = None) -> None:
+                 f_max: Optional[float] = None):
         super(InverseMelScale, self).__init__()
         self.n_mels = n_mels
         self.sample_rate = sample_rate
         self.f_max = f_max or float(sample_rate // 2)
         self.f_min = f_min
-        self.max_iter = max_iter
-        self.tolerance_loss = tolerance_loss
-        self.tolerance_change = tolerance_change
-        self.sgdargs = sgdargs or {'lr': 0.1, 'momentum': 0.9}
 
         assert f_min <= self.f_max, 'Require f_min: {} < f_max: {}'.format(f_min, self.f_max)
 
         fb = F.create_fb_matrix(n_stft, self.f_min, self.f_max, self.n_mels, self.sample_rate)
+        # Create Moore-Penrose Pseudo inverse
+        fb_plus = fb.transpose(0,1).pinverse()
         self.register_buffer('fb', fb)
+        self.register_buffer('fb_plus', fb_plus)
 
     def forward(self, melspec: Tensor) -> Tensor:
         r"""
@@ -326,42 +315,8 @@ class InverseMelScale(torch.nn.Module):
         Returns:
             Tensor: Linear scale spectrogram of size (..., freq, time)
         """
-        # pack batch
-        shape = melspec.size()
-        melspec = melspec.view(-1, shape[-2], shape[-1])
 
-        n_mels, time = shape[-2], shape[-1]
-        freq, _ = self.fb.size()  # (freq, n_mels)
-        melspec = melspec.transpose(-1, -2)
-        assert self.n_mels == n_mels
-
-        specgram = torch.rand(melspec.size()[0], time, freq, requires_grad=True,
-                              dtype=melspec.dtype, device=melspec.device)
-
-        optim = torch.optim.SGD([specgram], **self.sgdargs)
-
-        loss = float('inf')
-        for _ in range(self.max_iter):
-            optim.zero_grad()
-            diff = melspec - specgram.matmul(self.fb)
-            new_loss = diff.pow(2).sum(axis=-1).mean()
-            # take sum over mel-frequency then average over other dimensions
-            # so that loss threshold is applied par unit timeframe
-            new_loss.backward()
-            optim.step()
-            specgram.data = specgram.data.clamp(min=0)
-
-            new_loss = new_loss.item()
-            if new_loss < self.tolerance_loss or abs(loss - new_loss) < self.tolerance_change:
-                break
-            loss = new_loss
-
-        specgram.requires_grad_(False)
-        specgram = specgram.clamp(min=0).transpose(-1, -2)
-
-        # unpack batch
-        specgram = specgram.view(shape[:-2] + (freq, time))
-        return specgram
+        return torch.matmul(self.fb_plus, melspec)
 
 
 class MelSpectrogram(torch.nn.Module):
